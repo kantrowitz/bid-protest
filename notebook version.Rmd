@@ -1,0 +1,317 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Other sources: FBO, FPDS, SAM.gov, GAO protests, grants.gov, USAspending, and a few others -- from a conversation with govtribe.com
+
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+```{r}
+
+# setwd("~/ShaunSo/Bid Protests/Sunlight code")
+library(jsonlite)
+library(rlist)
+URL <- "https://fedapi.io:443/api/catalog/gao/procurement/bidprotestdecisions/record/search?q=*&size=4132"
+test <- fromJSON(URL)
+test <- test$record
+list.save(test, "datadumpmaster.rds")
+ids <- test$id
+write.csv(ids, "ids.csv")
+ids <- data.frame(ids) #important, later
+meta <- test$meta
+```
+Next step: simplifying the data and making it useable.
+
+
+```{r}
+library(dplyr) # yeah, baby, some piping action coming up at the end (magrittr). Also, select and mutate.
+newtest <- select(test, -id)
+write.csv(meta, "meta.csv")
+meta <- select(meta, timestamp:source)
+meta <- select(meta, -classification)
+meta <- bind_cols(meta, ids) #join ids back in 
+meta <- meta[, c(4,3,2,1)] # reorder the columns for fun
+```
+Broke each sublist into its own variable for speed and ease. A bit kludgey, but there weren't that many.
+
+```{r}
+record <- test$record
+record_id <- record$id #duplicate of IDs, don't really need this
+matterof <- record$matterof
+file <- record$file
+date <- record$date
+decision_pdf <- record$decision_pdf
+summaryrecord <- record$summary
+agencies <- record$agencies_mentioned
+decision <- record$decision
+contacts <- record$contacts
+names(decision) <- c("Summary", "Verdict", "Long")
+
+```
+Make something we can use right now:
+
+```{r}
+decision_pdf <- data.frame(decision_pdf)
+long <- decision$Long
+decision <- select(decision, -3)
+usable_now <- bind_cols(meta, decision_pdf)
+usable_now <- bind_cols(usable_now, decision) #accelerate the coolness
+usable_now$ids <- as.character(usable_now$ids) #convert to strings if not fixed above already.
+usable_now$decision_pdf <- as.character(usable_now$decision_pdf) #same
+write.csv(usable_now, "usethis1.csv")
+usable_now <- bind_cols(usable_now, decision) 
+
+```
+Get fancy with agencies and other info. 
+
+Studied this: http://stackoverflow.com/questions/4227223/r-list-to-data-frame
+and : http://stackoverflow.com/questions/35444968/read-json-file-into-a-data-frame-without-nested-lists/35519498#35519498
+
+and http://r.789695.n4.nabble.com/Convert-quot-ragged-quot-list-to-matrix-td895283.html
+```{r}
+ agencyNames <- lapply(1:4132, function(x) x <- agencies[[x]]$Name)
+ agencyIDs <- lapply(1:4132, function(x) x <- agencies[[x]]$Id)
+ agencyURIs <- lapply(1:4132, function(x) x <- agencies[[x]]$URI)
+```
+Note: you can't use something like: 
+
+agencies_test <- do.call(rbind.data.frame, agencies) 
+
+because it takes the two numbers in row three (for example) and separates them, instead of combining them into one cell. It does this wherever it encounters data separated by a comma. 
+
+-----
+
+The following works to change the list of files(each entry of which sometimes had multiple files in it) into a dataframe, with each list as an observation in list form. Good! (not this immediate next fragment, though!)
+
+```{r}
+usable_now <- bind_cols(usable_now, decision) 
+file_list <- data.frame(t(sapply(file,c))) # the transpose is necessary, this way. ???
+
+```
+
+Add on the original date to the usable file.
+
+```{r}
+colnames(usable_now) <- c("Ids", "Source", "TimeStampIso8601", "TimeStamp", "Decision_PDF", "Summary", "Verdict", "duh", "duh1", "duh2", "duh3") # Yes, this is stupid. It's a quick fix for now.
+usable_now <- select(usable_now, 1:7)
+original_date <- date$original_text
+new_usable <- mutate(usable_now, original_date=original_date)
+
+```
+
+Convert the empty records to a NA. This is trickier than it looks, and necessary. We don't want to lose the empty records because we want to create a matrix and not have ragged lists.
+
+```{r}
+listy <- sapply(file_list, function(f){is.na(f)<-which(f == '');f}) #R magic
+testy <- lapply(listy, function(x) {x[length(x)==0] <- c("NA"); x}) # ditch the empties. YA!! Too bad it takes two steps
+```
+Remove the extra objects that are unnecessary at this point:
+
+```{r}
+rm(URL, record_id, record, date,decision, decision_pdf, ids, meta, newtest, listy, testy)
+```
+This tests to see which entries are blank in the list of agencyIDs.
+```{r}
+cool <- lapply(1:4132, function(x) x <- is.integer(agencyIDs[[x]]) && length(agencyIDs[[x]] ==0L))
+cool <- unlist(cool) # No reason it should be a list. It then becomes a logical vector.
+4132 - sum(cool) # 4. It's not worth screwing around with this.
+cool <- !cool # because it's so not cool.
+these <- which(cool == TRUE) # a vector of indices of the records we need to fix, i.e. 3,4, 2449 and 2450. Because there's only 4 of them in this one... See below in the white for a faster (still not great) way around some of this.
+```
+
+Save this scrap of code: which(x %in% c(2,4)) will provide multiple matching on a long vector.
+
+Also, use stringr library (Hadleyverse):
+
+https://cran.r-project.org/web/packages/stringr/stringr.pdf , p6
+str_c -->> join multiple strings into a single string
+str_replace_na -->> converts NA to "NA"
+
+```{r}
+library(stringr)
+#  This worked to concat: 
+agencyIDs[these] <- str_c(agencyIDs[these], sep=" ", collapse=NULL)
+# It's a little messy, but I'm keeping it.
+agencyNames[these] <- str_c(agencyNames[these], sep=" ", collapse=NULL)
+agencyURIs[these] <- str_c(agencyURIs[these], sep=" ", collapse=NULL)
+agencyIDs <- unlist(agencyIDs)
+agencyNames <- unlist(agencyNames)
+agencyURIs <- unlist(agencyURIs)
+
+usable_now <- mutate(usable_now, AgencyID = agencyIDs) # should be piped
+usable_now <- mutate(usable_now, agencyName = agencyNames)
+usable_now <- mutate(usable_now, agencyURI = agencyURIs)
+```
+
+Do the same thing for agencyNames and agencyURIs?
+cool <- lapply(1:length(agencyNames), function(x) x <- which(!(agencyNames[x] %in% c("unknown")) ) && length(agencyIDs[[x]] ==0L)) # Gives logical vector this way, in one step.
+these <- which(cool == TRUE)
+
+```{r}
+
+#Some more clean up
+
+rm(agencyIDs,agencyNames,agencyURIs, cool)
+
+```
+Moving ever onward, to the "Matter Of" -- similar issue, much bigger, though. Getting to the meat of everything, now. Trick here is that some of the list items are missing, i.e., chr(0), and some have 1:3 parts. 
+
+Remove the extra characters from each one using regex?
+
+```{r}
+
+matterof <- gsub("c(\"", "", matterof, fixed=TRUE) %>% #PIPES!!
+            gsub("\", \"", ", ", ., fixed=TRUE) %>%
+            gsub("\")", "", ., fixed=TRUE)
+
+usable_now <- mutate(usable_now, MatterOf = matterof)
+
+```
+
+Moving on to SummaryRecord. Should make a function to handle this, but I'm cranking through and testing on the fly - each new type of record is different, it seems.
+
+
+```{r}
+# For Summary Record
+
+summaryrecord <- str_c(summaryrecord, sep=" ", collapse=NULL)
+summaryrecord <-   gsub("c(\"", "", summaryrecord, fixed=TRUE) %>%
+                   gsub("\", \"", ", ", ., fixed=TRUE) %>%
+                   gsub("\")", "", ., fixed=TRUE)
+
+usable_now <- mutate(usable_now, SummaryRecord = summaryrecord)
+
+rm(new_usable, test, matterof) # Clean environment. Don't ditch summaryrecord yet. Will need it later.
+
+```
+
+Now, we add the long, multipage description of the case. Note: the file that results is too big for Excel or .csv to really handle. Process this stuff here, NOT in Excel.
+```{r}
+# For Full Length Record ("Long")
+
+# long <- lapply(1:length(long), function(x) x <- str_c(long[x], sep=" ", collapse=NULL))
+# long <- unlist(long)
+
+write.csv(long, "long.csv") # this is a huge long pain in the ass. Too big for Excel and .csv to really handle. Process this stuff here, NOT in Excel.
+```
+
+"long" is a character array, even if it's a huge one. Regex in a vector op should do it. 
+
+```{r}
+# a general cleanup DON'T USE THIS UNLESS YOU WANT TO START ALL OVER
+
+rm(list = ls())
+
+```
+Side notes: It's not worth trying to extract the agencies here, although it could be done. For a long list, yes. Used Excel for most of it, (combinations extractable for automating in the future) and corrected by hand.
+
+
+```{r}
+# Add original_date?? Why not.. Get it outta here..
+
+usable_now <- mutate(usable_now, Original_Date = original_date)
+
+rm(original_date, these)
+```
+
+Here's the workhorse function for cleaning the long 'un, in place!!
+
+```{r}
+clean_it <- function(longversion) {
+                               gsub("c(\"", "", longversion, fixed=TRUE) %>%   
+                                gsub("\", \"", " :: ", ., fixed=TRUE) %>%
+                                gsub("RELEASE", "RELEASE: ", ., fixed=TRUE)  %>%
+                                gsub("\", \n\"", " :: ", ., fixed=TRUE)  %>%
+                                gsub("â<U+0080><U+0099>", "'", ., fixed=TRUE)  %>%
+                                gsub("OÂ<U+0092>", "'", ., fixed=TRUE)  %>%
+                                gsub("Â<U+0092>", "'", ., fixed=TRUE)   %>%
+                                gsub("Â<U+0094> x", "", ., fixed=TRUE)  %>%
+                                gsub("Â<U+0094>", "", ., fixed=TRUE)  %>%
+                                gsub("Â<U+0093>", "", ., fixed=TRUE)  %>%
+                                gsub("\"D", "D", ., fixed=TRUE)  %>%
+                                gsub(":Â ", ": ", ., fixed=TRUE)  %>%
+                                gsub("\\n\\t\\t\\t", "", ., fixed=TRUE)  %>%
+                                gsub("\\n\\t\\t", "", ., fixed=TRUE)  %>%
+                                gsub("â\u0080\u0099", "'", ., fixed=TRUE) %>%
+                                gsub("â\u0080\u0091", "-", ., fixed=TRUE)  %>%
+                                gsub("â<U+0080><U+0091>", "-", ., fixed=TRUE)
+}      
+
+
+```
+
+Thoughts on how to handle:
+hmm <- long[1:3] # created for testing 
+
+Looks like this one works.
+
+```{r}
+# hmm <- long[1:3] # created for testing 
+wow <- clean_it(long)
+
+```
+
+write this to a file for safe-keeping, if not already done.
+
+```{r}
+write.csv(wow, "long_cleaned.csv", sep=" ", na="NA", row.names=FALSE, col.names=FALSE)
+```
+
+Get the amounts.
+
+```{r}
+dollar_amounts <- str_extract_all(long, "\\$.{14}") # library(stringr), thank you Hadley!!!!
+# also works with library(gsubfn), then strapply(long, "\\$.{15}", I) and
+
+
+```
+
+Deal with the dollar_amounts
+
+```{r}
+cool <- sapply(1:length(dollar_amounts), function(x) x <- is.character(dollar_amounts[[x]]) && length(dollar_amounts[[x]] ==0L))
+these <- which(cool == TRUE) # the vector containing the dollar_amounts
+dollar_amounts[these] <- str_c(dollar_amounts[these], sep=",", collapse=NULL) # to join them
+
+lil_clean <- function(longversion) {
+                                gsub("c(\"", "", longversion, fixed=TRUE) %>%   
+                                gsub("\\\\", "", .) %>%  
+                                gsub("\"", "", .) 
+}
+
+dollar_amounts <- lil_clean((dollar_amounts))
+```
+
+Write it out.
+
+```{r}
+
+usable_now <- mutate(usable_now, Dollar_Amounts = dollar_amounts)
+write.csv(usable_now, "with_dollar_amounts.csv")
+
+```
+
+Get the RFQ #s.
+
+numbers <- regmatches(summaryrecord, gregexpr("(?=(\\(RFP|\\(TORFP|\\(RFTOP|\\(RFQ|\\(TOR)).*?(?=(\\,|for|issued|\\(f|\\.\\sTh|\\st))", summaryrecord, perl=TRUE))
+
+OR
+
+numbers <- regmatches(summaryrecord, gregexpr("(?=(No\\.|Nos\\.)).*?(?=(\\,|for|issued|\\(f|\\.\\sTh|\\st))", summaryrecord, perl=TRUE))
+
+Regex for days.
+```{r}
+numbers <- regmatches(summaryrecord, gregexpr("(?=(\\(RFP|\\(TORFP|\\(RFTOP|\\(RFQ|\\(TOR)).*?(?=(\\,|for|issued|\\(f|\\.\\sTh|\\st))", summaryrecord, perl=TRUE))
+numbers <- gsub("char\\(0\\)", "N\\A", numbers)
+usable_now <- mutate(usable_now, RFQ_Num = numbers)
+write.csv(usable_now, "with_dollar_and_RFQs.csv")
+```
+
